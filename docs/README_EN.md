@@ -27,7 +27,7 @@ Claude --MCP--> Grok Search Server
 ### Features
 
 - **Dual Engine**: Grok search + Tavily extraction/mapping, complementary collaboration
-- **OpenAI-compatible interface**, supports any Grok mirror endpoint
+- **Dual protocol support**: OpenAI Chat Completions and Responses API
 - **Automatic time injection** (detects time-related queries, injects local time context)
 - One-click disable Claude Code's built-in WebSearch/WebFetch, force routing to this tool
 - Smart retry (Retry-After header parsing + exponential backoff)
@@ -123,9 +123,10 @@ You can also configure additional environment variables in the `env` field:
 |----------|----------|---------|-------------|
 | `GUDA_API_KEY` | No | - | GuDa API key (auto-derives all service URLs and keys when set) |
 | `GUDA_BASE_URL` | No | `https://code.guda.studio` | GuDa service base URL |
-| `GROK_API_URL` | No | `{GUDA_BASE_URL}/grok/v1` | Grok API endpoint (OpenAI-compatible), overrides GuDa-derived value |
+| `GROK_API_URL` | No | `{GUDA_BASE_URL}/grok/v1` | OpenAI-compatible Grok API endpoint, usually ending in `/v1` |
 | `GROK_API_KEY` | No | `{GUDA_API_KEY}` | Grok API key, overrides GuDa-derived value |
 | `GROK_MODEL` | No | `grok-4.20-beta` | Default model (takes precedence over `~/.config/grok-search/config.json` when set) |
+| `GROK_API_MODE` | No | `auto` | API protocol: `auto`, `chat_completions`, or `responses`; auto selects Responses API for multi-agent models |
 | `TAVILY_API_KEY` | No | `{GUDA_API_KEY}` | Tavily API key (for web_fetch / web_map) |
 | `TAVILY_API_URL` | No | `{GUDA_BASE_URL}/tavily` | Tavily API endpoint |
 | `TAVILY_ENABLED` | No | `true` | Enable Tavily |
@@ -162,9 +163,9 @@ This will automatically modify the **project-level** `.claude/settings.json` `pe
 
 ### `web_search` — AI Web Search
 
-Executes AI-driven web search via Grok API. By default it returns only Grok's answer and a `session_id` for retrieving sources later.
+Executes AI-driven web search through Grok. Responses mode calls `/responses` with the `web_search` tool for multi-agent models, while Chat Completions mode preserves compatibility with legacy mirror endpoints. The default `auto` mode selects Responses API for models whose names contain `multi-agent`.
 
-`web_search` does not expand sources in the response; it only returns `sources_count`. Sources are cached server-side by `session_id` and can be fetched with `get_sources`.
+`web_search` does not expand sources in the response; it only returns `sources_count`. Responses API `url_citation` annotations and optional Tavily/Firecrawl sources are cached by `session_id` and can be fetched with `get_sources`. Upstream failures are exposed in an `error` field instead of silently becoming empty content.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -252,7 +253,7 @@ A: Set `GUDA_API_KEY` to get full Grok + Tavily + Firecrawl service. Without GuD
 <summary>
 Q: What format does the Grok API URL need?
 </summary>
-A: An OpenAI-compatible API endpoint (supporting `/chat/completions` and `/models` endpoints). If using official Grok, access it through an OpenAI-compatible mirror.
+A: Use an OpenAI-compatible endpoint. Legacy mode requires `/chat/completions` and `/models`; Responses mode also requires `/responses` and support for the `web_search` tool. For multi-agent models, set `GROK_API_MODE=responses` or keep the default `auto` selection.
 </details>
 
 <details>

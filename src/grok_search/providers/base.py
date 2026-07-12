@@ -1,5 +1,14 @@
 from abc import ABC, abstractmethod
-from typing import Dict, List
+from dataclasses import dataclass, field
+from typing import Dict
+
+
+@dataclass
+class SearchResponse:
+    """搜索 Provider 的统一结构化返回值。"""
+
+    content: str
+    sources: list[dict] = field(default_factory=list)
 
 
 class SearchResult:
@@ -33,7 +42,7 @@ class BaseSearchProvider(ABC):
         self.api_key = api_key
 
     @abstractmethod
-    async def search(self, query: str, max_results: int = 5) -> List[SearchResult]:
+    async def search(self, query: str, max_results: int = 5) -> SearchResponse:
         pass
 
     @abstractmethod

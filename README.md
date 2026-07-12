@@ -28,7 +28,7 @@ Claude ──MCP──► Grok Search Server
 
 - **双引擎**：Grok 搜索 + Tavily 抓取/映射，互补协作
 - **Firecrawl 托底**：Tavily 提取失败时自动降级到 Firecrawl Scrape，支持空内容自动重试
-- **OpenAI 兼容接口**，支持任意 Grok 镜像站
+- **双协议兼容**：支持 OpenAI Chat Completions 与 Responses API
 - **自动时间注入**（检测时间相关查询，注入本地时间上下文）
 - 一键禁用 Claude Code 官方 WebSearch/WebFetch，强制路由到本工具
 - 智能重试（支持 Retry-After 头解析 + 指数退避）
@@ -123,9 +123,10 @@ claude mcp add-json grok-search --scope user '{
 
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
-| `GROK_API_URL` | ✅ | - | Grok API 地址（OpenAI 兼容格式） |
+| `GROK_API_URL` | ✅ | - | Grok API 地址（OpenAI 兼容格式，通常以 `/v1` 结尾） |
 | `GROK_API_KEY` | ✅ | - | Grok API 密钥 |
 | `GROK_MODEL` | ❌ | `grok-4-fast` | 默认模型（设置后优先于 `~/.config/grok-search/config.json`） |
+| `GROK_API_MODE` | ❌ | `auto` | API 协议：`auto`、`chat_completions` 或 `responses`；`auto` 会为 multi-agent 模型选择 Responses API |
 | `TAVILY_API_KEY` | ❌ | - | Tavily API 密钥（用于 web_fetch / web_map） |
 | `TAVILY_API_URL` | ❌ | `https://api.tavily.com` | Tavily API 地址 |
 | `TAVILY_ENABLED` | ❌ | `true` | 是否启用 Tavily |
@@ -160,9 +161,9 @@ claude mcp list
 
 ### `web_search` — AI 网络搜索
 
-通过 Grok API 执行 AI 驱动的网络搜索，默认仅返回 Grok 的回答正文，并返回 `session_id` 以便后续获取信源。
+通过 Grok API 执行 AI 驱动的网络搜索。Responses 模式会调用 `/responses` 并启用 `web_search` 工具，可用于 multi-agent 模型；Chat Completions 模式保留对旧镜像站的兼容。默认 `auto` 模式会为名称包含 `multi-agent` 的模型自动选择 Responses API。
 
-`web_search` 输出不展开信源，仅返回 `sources_count`；信源会按 `session_id` 缓存在服务端，可用 `get_sources` 拉取。
+`web_search` 输出不展开信源，仅返回 `sources_count`；Responses API 的 `url_citation` 注解及额外 Tavily/Firecrawl 信源会按 `session_id` 缓存在服务端，可用 `get_sources` 拉取。上游错误会通过返回值中的 `error` 字段明确报告，不再静默变成空正文。
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
@@ -250,7 +251,7 @@ A: Grok（`GROK_API_URL` + `GROK_API_KEY`）为必填，提供核心搜索能力
 <summary>
 Q: Grok API 地址需要什么格式？
 </summary>
-A: 需要 OpenAI 兼容格式的 API 地址（支持 `/chat/completions` 和 `/models` 端点）。如使用官方 Grok，需通过兼容 OpenAI 格式的镜像站访问。
+A: 需要 OpenAI 兼容格式的 API 地址。旧协议需要 `/chat/completions` 和 `/models`；Responses 模式还需要 `/responses` 以及 `web_search` 工具支持。使用 multi-agent 模型时建议设置 `GROK_API_MODE=responses`，或保留默认 `auto` 自动选择。
 </details>
 
 <details>

@@ -67,6 +67,24 @@ def merge_sources(*source_lists: list[dict]) -> list[dict]:
     return merged
 
 
+def allocate_extra_sources(
+    extra_sources: int,
+    has_tavily: bool,
+    has_firecrawl: bool,
+) -> tuple[int, int]:
+    """按可用 Provider 分配额外信源配额，返回 (tavily, firecrawl)。"""
+    if extra_sources <= 0:
+        return 0, 0
+    if has_tavily and has_firecrawl:
+        tavily_count = (extra_sources + 1) // 2
+        return tavily_count, extra_sources - tavily_count
+    if has_tavily:
+        return extra_sources, 0
+    if has_firecrawl:
+        return 0, extra_sources
+    return 0, 0
+
+
 def split_answer_and_sources(text: str) -> tuple[str, list[dict]]:
     raw = (text or "").strip()
     if not raw:

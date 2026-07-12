@@ -2,11 +2,10 @@ import httpx
 import json
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import List, Optional
+from typing import Any, Optional
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_random_exponential
 from tenacity.wait import wait_base
-from zoneinfo import ZoneInfo
-from .base import BaseSearchProvider, SearchResult
+from .base import BaseSearchProvider, SearchResponse
 from ..utils import search_prompt, fetch_prompt, url_describe_prompt, rank_sources_prompt
 from ..logger import log_info
 from ..config import config
@@ -70,12 +69,56 @@ def _needs_time_context(query: str) -> bool:
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
+class GrokAPIError(RuntimeError):
+    """Grok 上游返回的可诊断错误。"""
+
+    def __init__(self, message: str, status_code: int | None = None, code: str = ""):
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+
+
+def _api_error_from_payload(error: Any, status_code: int | None = None) -> GrokAPIError:
+    if isinstance(error, dict):
+        code = str(error.get("code") or error.get("type") or "")
+        message = str(error.get("message") or code or "Unknown API error")
+    else:
+        code = ""
+        message = str(error or "Unknown API error")
+
+    prefix = f"Grok API error {status_code}" if status_code is not None else "Grok API error"
+    if code:
+        return GrokAPIError(f"{prefix} ({code}): {message}", status_code, code)
+    return GrokAPIError(f"{prefix}: {message}", status_code, code)
+
+
+def _api_error_from_response(response: httpx.Response) -> GrokAPIError:
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, ValueError):
+        payload = None
+
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if error:
+        return _api_error_from_payload(error, response.status_code)
+
+    body = response.text.strip()
+    if len(body) > 500:
+        body = body[:500] + "..."
+    return GrokAPIError(
+        f"Grok API error {response.status_code}: {body or response.reason_phrase}",
+        response.status_code,
+    )
+
+
 def _is_retryable_exception(exc) -> bool:
     """检查异常是否可重试"""
     if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError, httpx.RemoteProtocolError)):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in RETRYABLE_STATUS_CODES
+    if isinstance(exc, GrokAPIError):
+        return exc.status_code in RETRYABLE_STATUS_CODES
     return False
 
 
@@ -118,14 +161,35 @@ class _WaitWithRetryAfter(wait_base):
 
 
 class GrokSearchProvider(BaseSearchProvider):
-    def __init__(self, api_url: str, api_key: str, model: str = "grok-4-fast"):
+    def __init__(
+        self,
+        api_url: str,
+        api_key: str,
+        model: str = "grok-4-fast",
+        api_mode: str = "auto",
+    ):
         super().__init__(api_url, api_key)
         self.model = model
+        self.api_mode = api_mode
 
     def get_provider_name(self) -> str:
         return "Grok"
 
-    async def search(self, query: str, platform: str = "", min_results: int = 3, max_results: int = 10, ctx=None) -> List[SearchResult]:
+    def _resolved_api_mode(self) -> str:
+        if self.api_mode != "auto":
+            return self.api_mode
+        if "multi-agent" in self.model.lower():
+            return "responses"
+        return "chat_completions"
+
+    async def search(
+        self,
+        query: str,
+        platform: str = "",
+        min_results: int = 3,
+        max_results: int = 10,
+        ctx=None,
+    ) -> SearchResponse:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -137,21 +201,122 @@ class GrokSearchProvider(BaseSearchProvider):
 
         time_context = get_local_time_info() + "\n"
 
+        await log_info(ctx, f"platform_prompt: { query + platform_prompt}", config.debug_enabled)
+
+        user_input = time_context + query + platform_prompt
+        if self._resolved_api_mode() == "responses":
+            payload = {
+                "model": self.model,
+                "instructions": search_prompt,
+                "input": user_input,
+                "tools": [{"type": "web_search"}],
+            }
+            return await self._execute_responses_with_retry(headers, payload, ctx)
+
         payload = {
             "model": self.model,
             "messages": [
-                {
-                    "role": "system",
-                    "content": search_prompt,
-                },
-                {"role": "user", "content": time_context + query + platform_prompt},
+                {"role": "system", "content": search_prompt},
+                {"role": "user", "content": user_input},
             ],
             "stream": True,
         }
+        content = await self._execute_stream_with_retry(headers, payload, ctx)
+        return SearchResponse(content=content)
 
-        await log_info(ctx, f"platform_prompt: { query + platform_prompt}", config.debug_enabled)
+    @staticmethod
+    def _parse_responses_payload(payload: dict) -> SearchResponse:
+        error = payload.get("error")
+        if error:
+            raise _api_error_from_payload(error)
 
-        return await self._execute_stream_with_retry(headers, payload, ctx)
+        content_parts: list[str] = []
+        sources: list[dict] = []
+        seen_urls: set[str] = set()
+
+        def add_source(raw: Any) -> None:
+            if not isinstance(raw, dict):
+                return
+            citation = raw.get("url_citation")
+            if isinstance(citation, dict):
+                raw = citation
+            url = raw.get("url")
+            if not isinstance(url, str) or not url.strip():
+                return
+            url = url.strip()
+            if url in seen_urls:
+                return
+            seen_urls.add(url)
+            item = {"url": url, "provider": "grok"}
+            title = raw.get("title")
+            if isinstance(title, str) and title.strip():
+                item["title"] = title.strip()
+            sources.append(item)
+
+        for output in payload.get("output") or []:
+            if not isinstance(output, dict):
+                continue
+            if output.get("type") == "message":
+                for item in output.get("content") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    text = item.get("text")
+                    if item.get("type") == "output_text" and isinstance(text, str):
+                        content_parts.append(text)
+                    for annotation in item.get("annotations") or []:
+                        add_source(annotation)
+            elif output.get("type") == "web_search_call":
+                action = output.get("action")
+                if isinstance(action, dict):
+                    for source in action.get("sources") or []:
+                        add_source(source)
+
+        content = "".join(content_parts).strip()
+        if not content:
+            status = payload.get("status") or "unknown"
+            details = payload.get("incomplete_details")
+            suffix = f": {details}" if details else ""
+            raise GrokAPIError(f"Responses API returned no output text (status={status}){suffix}")
+        return SearchResponse(content=content, sources=sources)
+
+    async def _execute_responses_with_retry(
+        self,
+        headers: dict,
+        payload: dict,
+        ctx=None,
+    ) -> SearchResponse:
+        timeout = httpx.Timeout(connect=6.0, read=300.0, write=10.0, pool=None)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(config.retry_max_attempts + 1),
+                wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
+                retry=retry_if_exception(_is_retryable_exception),
+                reraise=True,
+            ):
+                with attempt:
+                    response = await client.post(
+                        f"{self.api_url}/responses",
+                        headers=headers,
+                        json=payload,
+                    )
+                    if response.is_error:
+                        raise _api_error_from_response(response)
+                    try:
+                        data = response.json()
+                    except (json.JSONDecodeError, ValueError) as exc:
+                        raise GrokAPIError(
+                            f"Responses API returned invalid JSON: {exc}",
+                            response.status_code,
+                        ) from exc
+                    result = self._parse_responses_payload(data)
+                    await log_info(
+                        ctx,
+                        f"responses content length: {len(result.content)}, sources: {len(result.sources)}",
+                        config.debug_enabled,
+                    )
+                    return result
+
+        raise GrokAPIError("Responses API request exhausted retries")
 
     async def fetch(self, url: str, ctx=None) -> str:
         headers = {
@@ -190,11 +355,14 @@ class GrokSearchProvider(BaseSearchProvider):
                     # 去掉 "data:" 前缀，并去除可能的空格
                     json_str = line[5:].lstrip()
                     data = json.loads(json_str)
+                    if data.get("error"):
+                        raise _api_error_from_payload(data["error"], response.status_code)
                     choices = data.get("choices", [])
                     if choices and len(choices) > 0:
                         delta = choices[0].get("delta", {})
-                        if "content" in delta:
-                            content += delta["content"]
+                        delta_content = delta.get("content")
+                        if isinstance(delta_content, str):
+                            content += delta_content
                 except (json.JSONDecodeError, IndexError):
                     continue
                 
@@ -204,12 +372,16 @@ class GrokSearchProvider(BaseSearchProvider):
                 data = json.loads(full_text)
                 if "choices" in data and len(data["choices"]) > 0:
                     message = data["choices"][0].get("message", {})
-                    content = message.get("content", "")
+                    message_content = message.get("content", "")
+                    if isinstance(message_content, str):
+                        content = message_content
             except json.JSONDecodeError:
                 pass
         
         await log_info(ctx, f"content: {content}", config.debug_enabled)
 
+        if not content:
+            raise GrokAPIError("Chat Completions API returned no text content")
         return content
 
     async def _execute_stream_with_retry(self, headers: dict, payload: dict, ctx=None) -> str:
@@ -230,8 +402,13 @@ class GrokSearchProvider(BaseSearchProvider):
                         headers=headers,
                         json=payload,
                     ) as response:
-                        response.raise_for_status()
+                        if response.is_error:
+                            body = await response.aread()
+                            response._content = body
+                            raise _api_error_from_response(response)
                         return await self._parse_streaming_response(response, ctx)
+
+        raise GrokAPIError("Chat Completions request exhausted retries")
 
     async def describe_url(self, url: str, ctx=None) -> dict:
         """让 Grok 阅读单个 URL 并返回 title + extracts"""

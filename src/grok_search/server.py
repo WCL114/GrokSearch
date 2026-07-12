@@ -15,13 +15,25 @@ try:
     from grok_search.providers.grok import GrokSearchProvider
     from grok_search.logger import log_info
     from grok_search.config import config
-    from grok_search.sources import SourcesCache, merge_sources, new_session_id, split_answer_and_sources
+    from grok_search.sources import (
+        SourcesCache,
+        allocate_extra_sources,
+        merge_sources,
+        new_session_id,
+        split_answer_and_sources,
+    )
     from grok_search.planning import engine as planning_engine, _split_csv
 except ImportError:
     from .providers.grok import GrokSearchProvider
     from .logger import log_info
     from .config import config
-    from .sources import SourcesCache, merge_sources, new_session_id, split_answer_and_sources
+    from .sources import (
+        SourcesCache,
+        allocate_extra_sources,
+        merge_sources,
+        new_session_id,
+        split_answer_and_sources,
+    )
     from .planning import engine as planning_engine, _split_csv
 
 import asyncio
@@ -147,28 +159,30 @@ async def web_search(
             return {"session_id": session_id, "content": f"无效模型: {model}", "sources_count": 0}
         effective_model = model
 
-    grok_provider = GrokSearchProvider(api_url, api_key, effective_model)
+    grok_provider = GrokSearchProvider(
+        api_url,
+        api_key,
+        effective_model,
+        api_mode=config.grok_api_mode,
+    )
 
     # 计算额外信源配额
-    has_tavily = bool(config.tavily_api_key)
+    has_tavily = config.tavily_enabled and bool(config.tavily_api_key)
     has_firecrawl = bool(config.firecrawl_api_key)
-    firecrawl_count = 0
-    tavily_count = 0
-    if extra_sources > 0:
-        if has_firecrawl and has_tavily:
-            firecrawl_count = round(extra_sources * 1)
-            tavily_count = extra_sources - firecrawl_count
-        elif has_firecrawl:
-            firecrawl_count = extra_sources
-        elif has_tavily:
-            tavily_count = extra_sources
+    tavily_count, firecrawl_count = allocate_extra_sources(
+        extra_sources,
+        has_tavily,
+        has_firecrawl,
+    )
 
     # 并行执行搜索任务
-    async def _safe_grok() -> str:
+    async def _safe_grok():
         try:
-            return await grok_provider.search(query, platform)
-        except Exception:
-            return ""
+            return await grok_provider.search(query, platform), None
+        except Exception as exc:
+            message = str(exc) or exc.__class__.__name__
+            await log_info(None, f"Grok search failed: {message}", config.debug_enabled)
+            return None, message
 
     async def _safe_tavily() -> list[dict] | None:
         try:
@@ -192,7 +206,7 @@ async def web_search(
 
     gathered = await asyncio.gather(*coros)
 
-    grok_result: str = gathered[0] or ""
+    grok_result, grok_error = gathered[0]
     tavily_results: list[dict] | None = None
     firecrawl_results: list[dict] | None = None
     idx = 1
@@ -202,12 +216,20 @@ async def web_search(
     if firecrawl_count > 0:
         firecrawl_results = gathered[idx]
 
-    answer, grok_sources = split_answer_and_sources(grok_result)
+    answer = ""
+    provider_sources: list[dict] = []
+    parsed_sources: list[dict] = []
+    if grok_result is not None:
+        answer, parsed_sources = split_answer_and_sources(grok_result.content)
+        provider_sources = grok_result.sources
     extra = _extra_results_to_sources(tavily_results, firecrawl_results)
-    all_sources = merge_sources(grok_sources, extra)
+    all_sources = merge_sources(provider_sources, parsed_sources, extra)
 
     await _SOURCES_CACHE.set(session_id, all_sources)
-    return {"session_id": session_id, "content": answer, "sources_count": len(all_sources)}
+    result = {"session_id": session_id, "content": answer, "sources_count": len(all_sources)}
+    if grok_error:
+        result["error"] = grok_error
+    return result
 
 
 @mcp.tool(

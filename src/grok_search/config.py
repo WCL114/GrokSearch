@@ -11,6 +11,7 @@ class Config:
         '"env":{"GROK_API_URL":"your-api-url","GROK_API_KEY":"your-api-key"}}\''
     )
     _DEFAULT_MODEL = "grok-4-fast"
+    _VALID_API_MODES = {"auto", "chat_completions", "responses"}
 
     def __new__(cls):
         if cls._instance is None:
@@ -62,6 +63,14 @@ class Config:
     @property
     def retry_max_wait(self) -> int:
         return int(os.getenv("GROK_RETRY_MAX_WAIT", "10"))
+
+    @property
+    def grok_api_mode(self) -> str:
+        mode = os.getenv("GROK_API_MODE", "auto").strip().lower()
+        if mode not in self._VALID_API_MODES:
+            valid = ", ".join(sorted(self._VALID_API_MODES))
+            raise ValueError(f"GROK_API_MODE 必须是以下值之一: {valid}")
+        return mode
 
     @property
     def grok_api_url(self) -> str:
@@ -183,6 +192,7 @@ class Config:
             "GROK_API_URL": api_url,
             "GROK_API_KEY": api_key_masked,
             "GROK_MODEL": self.grok_model,
+            "GROK_API_MODE": self.grok_api_mode,
             "GROK_DEBUG": self.debug_enabled,
             "GROK_LOG_LEVEL": self.log_level,
             "GROK_LOG_DIR": str(self.log_dir),
