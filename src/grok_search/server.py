@@ -7,14 +7,14 @@ if str(src_dir) not in sys.path:
     sys.path.insert(0, str(src_dir))
 
 from fastmcp import FastMCP, Context
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 from pydantic import Field
 
 # 尝试使用绝对导入（支持 mcp run）
 try:
     from grok_search.providers.grok import GrokSearchProvider
     from grok_search.logger import log_info
-    from grok_search.config import config
+    from grok_search.config import DEFAULT_RESPONSE_EFFORT, config
     from grok_search.sources import (
         SourcesCache,
         allocate_extra_sources,
@@ -26,7 +26,7 @@ try:
 except ImportError:
     from .providers.grok import GrokSearchProvider
     from .logger import log_info
-    from .config import config
+    from .config import DEFAULT_RESPONSE_EFFORT, config
     from .sources import (
         SourcesCache,
         allocate_extra_sources,
@@ -134,6 +134,8 @@ def _extra_results_to_sources(
     - session_id: string (When you feel confused or curious about the main content, use this field to invoke the get_sources tool to obtain the corresponding list of information sources)
     - content: string (answer only)
     - sources_count: int
+    - status: completed | incomplete | failed
+    - error: string (only when the request did not complete cleanly)
     """,
     meta={"version": "2.0.0", "author": "guda.studio"},
 )
@@ -142,6 +144,7 @@ async def web_search(
     platform: Annotated[str, "Target platform to focus on (e.g., 'Twitter', 'GitHub', 'Reddit'). Leave empty for general web search."] = "",
     model: Annotated[str, "Optional model ID for this request only. This value is used ONLY when user explicitly provided."] = "",
     extra_sources: Annotated[int, "Number of additional reference results from Tavily/Firecrawl. Set 0 to disable. Default 0."] = 0,
+    effort: Annotated[Literal["low", "medium", "high", "xhigh"], "Responses API effort. low/medium use 4 agents; high/xhigh use 16 agents. Default high. GROK_RESPONSES_EFFORT overrides this value when configured."] = DEFAULT_RESPONSE_EFFORT,
 ) -> dict:
     session_id = new_session_id()
     try:
@@ -149,14 +152,24 @@ async def web_search(
         api_key = config.grok_api_key
     except ValueError as e:
         await _SOURCES_CACHE.set(session_id, [])
-        return {"session_id": session_id, "content": f"配置错误: {str(e)}", "sources_count": 0}
+        return {
+            "session_id": session_id,
+            "content": f"配置错误: {str(e)}",
+            "sources_count": 0,
+            "status": "failed",
+        }
 
     effective_model = config.grok_model
     if model:
         available = await _get_available_models_cached(api_url, api_key)
         if available and model not in available:
             await _SOURCES_CACHE.set(session_id, [])
-            return {"session_id": session_id, "content": f"无效模型: {model}", "sources_count": 0}
+            return {
+                "session_id": session_id,
+                "content": f"无效模型: {model}",
+                "sources_count": 0,
+                "status": "failed",
+            }
         effective_model = model
 
     grok_provider = GrokSearchProvider(
@@ -178,7 +191,7 @@ async def web_search(
     # 并行执行搜索任务
     async def _safe_grok():
         try:
-            return await grok_provider.search(query, platform), None
+            return await grok_provider.search(query, platform, effort=effort), None
         except Exception as exc:
             message = str(exc) or exc.__class__.__name__
             await log_info(None, f"Grok search failed: {message}", config.debug_enabled)
@@ -217,16 +230,25 @@ async def web_search(
         firecrawl_results = gathered[idx]
 
     answer = ""
+    status = "failed"
     provider_sources: list[dict] = []
     parsed_sources: list[dict] = []
     if grok_result is not None:
         answer, parsed_sources = split_answer_and_sources(grok_result.content)
         provider_sources = grok_result.sources
+        status = grok_result.status
+        if grok_result.error:
+            grok_error = grok_result.error
     extra = _extra_results_to_sources(tavily_results, firecrawl_results)
     all_sources = merge_sources(provider_sources, parsed_sources, extra)
 
     await _SOURCES_CACHE.set(session_id, all_sources)
-    result = {"session_id": session_id, "content": answer, "sources_count": len(all_sources)}
+    result = {
+        "session_id": session_id,
+        "content": answer,
+        "sources_count": len(all_sources),
+        "status": status,
+    }
     if grok_error:
         result["error"] = grok_error
     return result

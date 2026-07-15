@@ -1,6 +1,9 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, Literal
+
+
+SearchStatus = Literal["completed", "incomplete", "failed"]
 
 
 @dataclass
@@ -9,6 +12,8 @@ class SearchResponse:
 
     content: str
     sources: list[dict] = field(default_factory=list)
+    status: SearchStatus = "completed"
+    error: str | None = None
 
 
 class SearchResult:

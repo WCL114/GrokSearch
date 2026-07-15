@@ -127,6 +127,8 @@ You can also configure additional environment variables in the `env` field:
 | `GROK_API_KEY` | No | `{GUDA_API_KEY}` | Grok API key, overrides GuDa-derived value |
 | `GROK_MODEL` | No | `grok-4.20-beta` | Default model (takes precedence over `~/.config/grok-search/config.json` when set) |
 | `GROK_API_MODE` | No | `auto` | API protocol: `auto`, `chat_completions`, or `responses`; auto selects Responses API for multi-agent models |
+| `GROK_RESPONSES_READ_TIMEOUT` | No | `300` | Read timeout in seconds between Responses SSE events; must be positive |
+| `GROK_RESPONSES_EFFORT` | No | - | Global Responses effort; when set, it overrides every `web_search` effort argument |
 | `TAVILY_API_KEY` | No | `{GUDA_API_KEY}` | Tavily API key (for web_fetch / web_map) |
 | `TAVILY_API_URL` | No | `{GUDA_BASE_URL}/tavily` | Tavily API endpoint |
 | `TAVILY_ENABLED` | No | `true` | Enable Tavily |
@@ -163,9 +165,9 @@ This will automatically modify the **project-level** `.claude/settings.json` `pe
 
 ### `web_search` — AI Web Search
 
-Executes AI-driven web search through Grok. Responses mode calls `/responses` with the `web_search` tool for multi-agent models, while Chat Completions mode preserves compatibility with legacy mirror endpoints. The default `auto` mode selects Responses API for models whose names contain `multi-agent`.
+Executes AI-driven web search through Grok. Responses mode calls `/responses` with the `web_search` tool and consumes long-running requests as SSE, while Chat Completions mode preserves compatibility with legacy mirror endpoints. The default `auto` mode selects Responses API for models whose names contain `multi-agent`.
 
-`web_search` does not expand sources in the response; it only returns `sources_count`. Responses API `url_citation` annotations and optional Tavily/Firecrawl sources are cached by `session_id` and can be fetched with `get_sources`. Upstream failures are exposed in an `error` field instead of silently becoming empty content.
+`web_search` does not expand sources in the response; it only returns `sources_count`. Responses API `url_citation` annotations and optional Tavily/Firecrawl sources are cached by `session_id` and can be fetched with `get_sources`. The `status` field distinguishes `completed`, `incomplete`, and `failed`. If a connection drops after streaming starts, the request is not replayed; partial content and sources are returned with `incomplete` status.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -173,6 +175,9 @@ Executes AI-driven web search through Grok. Responses mode calls `/responses` wi
 | `platform` | string | No | `""` | Focus platform (e.g., `"Twitter"`, `"GitHub, Reddit"`) |
 | `model` | string | No | `null` | Per-request Grok model ID |
 | `extra_sources` | int | No | `0` | Extra sources via Tavily/Firecrawl (0 disables) |
+| `effort` | string | No | `"high"` | Responses agent scale: `low`, `medium`, `high`, or `xhigh` |
+
+`low` and `medium` use 4 agents for routine queries. `high` and `xhigh` use 16 agents for deeper research and usually consume more tokens. Chat Completions ignores this parameter. For example: `web_search(query="...", effort="high")`. To force every Responses search to use `xhigh`, set `GROK_RESPONSES_EFFORT=xhigh` in the MCP environment; this setting takes precedence over per-request arguments.
 
 Automatically detects time-related keywords in queries (e.g., "latest", "today", "recent"), injecting local time context to improve accuracy for time-sensitive searches.
 
@@ -180,6 +185,8 @@ Return value (structured dict):
 - `session_id`: search session ID
 - `content`: answer only (sources removed)
 - `sources_count`: cached sources count
+- `status`: `completed`, `incomplete`, or `failed`
+- `error`: optional explanation when the request does not complete cleanly
 
 ### `get_sources` — Retrieve Sources
 

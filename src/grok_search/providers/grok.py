@@ -2,13 +2,13 @@ import httpx
 import json
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_random_exponential
 from tenacity.wait import wait_base
 from .base import BaseSearchProvider, SearchResponse
 from ..utils import search_prompt, fetch_prompt, url_describe_prompt, rank_sources_prompt
 from ..logger import log_info
-from ..config import config
+from ..config import DEFAULT_RESPONSE_EFFORT, VALID_RESPONSE_EFFORTS, config
 
 
 def get_local_time_info() -> str:
@@ -67,6 +67,7 @@ def _needs_time_context(query: str) -> bool:
     return False
 
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+ResponseEffort = Literal["low", "medium", "high", "xhigh"]
 
 
 class GrokAPIError(RuntimeError):
@@ -76,6 +77,10 @@ class GrokAPIError(RuntimeError):
         super().__init__(message)
         self.status_code = status_code
         self.code = code
+
+
+class _RetryableResponsesProtocolError(GrokAPIError):
+    """Responses 流开始前出现的可重试协议错误。"""
 
 
 def _api_error_from_payload(error: Any, status_code: int | None = None) -> GrokAPIError:
@@ -113,6 +118,8 @@ def _api_error_from_response(response: httpx.Response) -> GrokAPIError:
 
 def _is_retryable_exception(exc) -> bool:
     """检查异常是否可重试"""
+    if isinstance(exc, _RetryableResponsesProtocolError):
+        return True
     if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError, httpx.RemoteProtocolError)):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
@@ -120,6 +127,221 @@ def _is_retryable_exception(exc) -> bool:
     if isinstance(exc, GrokAPIError):
         return exc.status_code in RETRYABLE_STATUS_CODES
     return False
+
+
+def _append_grok_source(
+    raw: Any,
+    sources: list[dict],
+    seen_urls: set[str],
+) -> None:
+    if not isinstance(raw, dict):
+        return
+    citation = raw.get("url_citation")
+    if isinstance(citation, dict):
+        raw = citation
+    url = raw.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return
+    url = url.strip()
+    if url in seen_urls:
+        return
+    seen_urls.add(url)
+    item = {"url": url, "provider": "grok"}
+    title = raw.get("title")
+    if isinstance(title, str) and title.strip():
+        item["title"] = title.strip()
+    sources.append(item)
+
+
+def _collect_responses_output(output_items: Any) -> tuple[str, list[dict]]:
+    content_parts: list[str] = []
+    sources: list[dict] = []
+    seen_urls: set[str] = set()
+
+    for output in output_items or []:
+        if not isinstance(output, dict):
+            continue
+        if output.get("type") == "message":
+            for item in output.get("content") or []:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if item.get("type") == "output_text" and isinstance(text, str):
+                    content_parts.append(text)
+                for annotation in item.get("annotations") or []:
+                    _append_grok_source(annotation, sources, seen_urls)
+        elif output.get("type") == "web_search_call":
+            action = output.get("action")
+            if isinstance(action, dict):
+                for source in action.get("sources") or []:
+                    _append_grok_source(source, sources, seen_urls)
+
+    return "".join(content_parts).strip(), sources
+
+
+def _responses_error_message(payload: dict) -> str | None:
+    error = payload.get("error")
+    if error:
+        return str(_api_error_from_payload(error))
+
+    details = payload.get("incomplete_details")
+    if isinstance(details, dict):
+        reason = details.get("reason")
+        if reason:
+            return f"Responses API incomplete: {reason}"
+    if details:
+        return f"Responses API incomplete: {details}"
+    return None
+
+
+def _parse_responses_payload_data(payload: dict) -> SearchResponse:
+    content, sources = _collect_responses_output(payload.get("output"))
+    raw_status = payload.get("status")
+    error = _responses_error_message(payload)
+
+    if raw_status == "incomplete":
+        status = "incomplete"
+        error = error or "Responses API returned an incomplete result"
+    elif error or raw_status in {"failed", "cancelled"}:
+        status = "failed"
+        error = error or f"Responses API ended with status: {raw_status}"
+    else:
+        status = "completed"
+
+    if not content and status == "completed":
+        status_text = raw_status or "unknown"
+        raise GrokAPIError(
+            f"Responses API returned no output text (status={status_text})"
+        )
+
+    return SearchResponse(
+        content=content,
+        sources=sources,
+        status=status,
+        error=error,
+    )
+
+
+class _ResponsesStreamAccumulator:
+    """累积 Responses SSE 事件，并保留可返回的部分结果。"""
+
+    def __init__(self):
+        self.received_event = False
+        self.terminal = False
+        self.status: str | None = None
+        self.error: str | None = None
+        self._content_parts: list[str] = []
+        self._fallback_content = ""
+        self._sources: list[dict] = []
+        self._seen_urls: set[str] = set()
+
+    def _add_source(self, raw: Any) -> None:
+        _append_grok_source(raw, self._sources, self._seen_urls)
+
+    def _add_output_item(self, item: Any) -> None:
+        content, sources = _collect_responses_output([item])
+        if content:
+            self._fallback_content = content
+        for source in sources:
+            self._add_source(source)
+
+    def _merge_result(self, result: SearchResponse) -> None:
+        if result.content:
+            self._fallback_content = result.content
+        for source in result.sources:
+            self._add_source(source)
+        self.status = result.status
+        self.error = result.error
+
+    def consume(self, payload: dict) -> None:
+        self.received_event = True
+        event_type = payload.get("type")
+
+        if not event_type and ("output" in payload or "status" in payload):
+            self._merge_result(_parse_responses_payload_data(payload))
+            self.terminal = True
+            return
+
+        if not event_type and payload.get("error"):
+            self.status = "failed"
+            self.error = str(_api_error_from_payload(payload["error"]))
+            self.terminal = True
+            return
+
+        if event_type == "response.output_text.delta":
+            delta = payload.get("delta")
+            if isinstance(delta, str):
+                self._content_parts.append(delta)
+            return
+
+        if event_type == "response.output_text.annotation.added":
+            self._add_source(payload.get("annotation") or payload)
+            return
+
+        if event_type == "response.output_text.done":
+            text = payload.get("text")
+            if isinstance(text, str):
+                self._fallback_content = text
+            return
+
+        if event_type == "response.content_part.done":
+            part = payload.get("part")
+            if isinstance(part, dict):
+                text = part.get("text")
+                if part.get("type") == "output_text" and isinstance(text, str):
+                    self._fallback_content = text
+                for annotation in part.get("annotations") or []:
+                    self._add_source(annotation)
+            return
+
+        if event_type == "response.output_item.done":
+            self._add_output_item(payload.get("item"))
+            return
+
+        if isinstance(event_type, str) and event_type.startswith("response.web_search_call."):
+            action = payload.get("action")
+            if isinstance(action, dict):
+                for source in action.get("sources") or []:
+                    self._add_source(source)
+            self._add_output_item(payload.get("item"))
+            return
+
+        if event_type in {
+            "response.completed",
+            "response.incomplete",
+            "response.failed",
+        }:
+            response_payload = payload.get("response")
+            if not isinstance(response_payload, dict):
+                response_payload = dict(payload)
+                response_payload.setdefault("status", event_type.removeprefix("response."))
+            self._merge_result(_parse_responses_payload_data(response_payload))
+            self.terminal = True
+            return
+
+        if event_type == "error":
+            self.status = "failed"
+            self.error = str(_api_error_from_payload(payload.get("error") or payload))
+            self.terminal = True
+
+    def result(
+        self,
+        default_status: str = "incomplete",
+        default_error: str | None = None,
+    ) -> SearchResponse:
+        content = "".join(self._content_parts).strip()
+        if not content:
+            content = self._fallback_content.strip()
+        status = self.status or default_status
+        error = self.error or default_error
+        if status == "completed" and not content:
+            raise GrokAPIError("Responses API completed without output text")
+        return SearchResponse(
+            content=content,
+            sources=self._sources,
+            status=status,
+            error=error,
+        )
 
 
 class _WaitWithRetryAfter(wait_base):
@@ -188,8 +410,13 @@ class GrokSearchProvider(BaseSearchProvider):
         platform: str = "",
         min_results: int = 3,
         max_results: int = 10,
+        effort: ResponseEffort = DEFAULT_RESPONSE_EFFORT,
         ctx=None,
     ) -> SearchResponse:
+        if effort not in VALID_RESPONSE_EFFORTS:
+            valid = ", ".join(sorted(VALID_RESPONSE_EFFORTS))
+            raise ValueError(f"effort must be one of: {valid}")
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -205,11 +432,14 @@ class GrokSearchProvider(BaseSearchProvider):
 
         user_input = time_context + query + platform_prompt
         if self._resolved_api_mode() == "responses":
+            effective_effort = config.responses_effort or effort
             payload = {
                 "model": self.model,
                 "instructions": search_prompt,
                 "input": user_input,
+                "reasoning": {"effort": effective_effort},
                 "tools": [{"type": "web_search"}],
+                "stream": True,
             }
             return await self._execute_responses_with_retry(headers, payload, ctx)
 
@@ -226,58 +456,71 @@ class GrokSearchProvider(BaseSearchProvider):
 
     @staticmethod
     def _parse_responses_payload(payload: dict) -> SearchResponse:
-        error = payload.get("error")
-        if error:
-            raise _api_error_from_payload(error)
+        return _parse_responses_payload_data(payload)
 
-        content_parts: list[str] = []
-        sources: list[dict] = []
-        seen_urls: set[str] = set()
+    async def _parse_responses_stream(self, response, ctx=None) -> SearchResponse:
+        accumulator = _ResponsesStreamAccumulator()
+        full_json_lines: list[str] = []
 
-        def add_source(raw: Any) -> None:
-            if not isinstance(raw, dict):
-                return
-            citation = raw.get("url_citation")
-            if isinstance(citation, dict):
-                raw = citation
-            url = raw.get("url")
-            if not isinstance(url, str) or not url.strip():
-                return
-            url = url.strip()
-            if url in seen_urls:
-                return
-            seen_urls.add(url)
-            item = {"url": url, "provider": "grok"}
-            title = raw.get("title")
-            if isinstance(title, str) and title.strip():
-                item["title"] = title.strip()
-            sources.append(item)
+        try:
+            async for raw_line in response.aiter_lines():
+                line = raw_line.strip()
+                if not line or line.startswith("event:"):
+                    continue
+                if not line.startswith("data:"):
+                    full_json_lines.append(line)
+                    continue
 
-        for output in payload.get("output") or []:
-            if not isinstance(output, dict):
-                continue
-            if output.get("type") == "message":
-                for item in output.get("content") or []:
-                    if not isinstance(item, dict):
-                        continue
-                    text = item.get("text")
-                    if item.get("type") == "output_text" and isinstance(text, str):
-                        content_parts.append(text)
-                    for annotation in item.get("annotations") or []:
-                        add_source(annotation)
-            elif output.get("type") == "web_search_call":
-                action = output.get("action")
-                if isinstance(action, dict):
-                    for source in action.get("sources") or []:
-                        add_source(source)
+                data_text = line[5:].lstrip()
+                if not data_text or data_text == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(data_text)
+                except json.JSONDecodeError:
+                    full_json_lines.append(data_text)
+                    continue
+                if not isinstance(event, dict):
+                    continue
 
-        content = "".join(content_parts).strip()
-        if not content:
-            status = payload.get("status") or "unknown"
-            details = payload.get("incomplete_details")
-            suffix = f": {details}" if details else ""
-            raise GrokAPIError(f"Responses API returned no output text (status={status}){suffix}")
-        return SearchResponse(content=content, sources=sources)
+                accumulator.consume(event)
+                if accumulator.terminal:
+                    result = accumulator.result()
+                    await log_info(
+                        ctx,
+                        f"responses stream status: {result.status}, content length: {len(result.content)}, sources: {len(result.sources)}",
+                        config.debug_enabled,
+                    )
+                    return result
+        except httpx.RequestError as exc:
+            if accumulator.received_event:
+                return accumulator.result(
+                    default_status="incomplete",
+                    default_error=f"Responses stream interrupted: {exc}",
+                )
+            raise
+
+        if accumulator.received_event:
+            return accumulator.result(
+                default_status="incomplete",
+                default_error="Responses stream ended before a terminal event",
+            )
+
+        if full_json_lines:
+            try:
+                payload = json.loads("".join(full_json_lines))
+            except json.JSONDecodeError as exc:
+                raise _RetryableResponsesProtocolError(
+                    f"Responses API returned invalid JSON before streaming: {exc}"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise _RetryableResponsesProtocolError(
+                    "Responses API returned a non-object JSON payload"
+                )
+            return self._parse_responses_payload(payload)
+
+        raise _RetryableResponsesProtocolError(
+            "Responses API returned an empty response before streaming"
+        )
 
     async def _execute_responses_with_retry(
         self,
@@ -285,7 +528,12 @@ class GrokSearchProvider(BaseSearchProvider):
         payload: dict,
         ctx=None,
     ) -> SearchResponse:
-        timeout = httpx.Timeout(connect=6.0, read=300.0, write=10.0, pool=None)
+        timeout = httpx.Timeout(
+            connect=6.0,
+            read=config.responses_read_timeout,
+            write=10.0,
+            pool=None,
+        )
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(config.retry_max_attempts + 1),
@@ -294,27 +542,17 @@ class GrokSearchProvider(BaseSearchProvider):
                 reraise=True,
             ):
                 with attempt:
-                    response = await client.post(
+                    async with client.stream(
+                        "POST",
                         f"{self.api_url}/responses",
                         headers=headers,
                         json=payload,
-                    )
-                    if response.is_error:
-                        raise _api_error_from_response(response)
-                    try:
-                        data = response.json()
-                    except (json.JSONDecodeError, ValueError) as exc:
-                        raise GrokAPIError(
-                            f"Responses API returned invalid JSON: {exc}",
-                            response.status_code,
-                        ) from exc
-                    result = self._parse_responses_payload(data)
-                    await log_info(
-                        ctx,
-                        f"responses content length: {len(result.content)}, sources: {len(result.sources)}",
-                        config.debug_enabled,
-                    )
-                    return result
+                    ) as response:
+                        if response.is_error:
+                            body = await response.aread()
+                            response._content = body
+                            raise _api_error_from_response(response)
+                        return await self._parse_responses_stream(response, ctx)
 
         raise GrokAPIError("Responses API request exhausted retries")
 

@@ -127,6 +127,8 @@ claude mcp add-json grok-search --scope user '{
 | `GROK_API_KEY` | ✅ | - | Grok API 密钥 |
 | `GROK_MODEL` | ❌ | `grok-4-fast` | 默认模型（设置后优先于 `~/.config/grok-search/config.json`） |
 | `GROK_API_MODE` | ❌ | `auto` | API 协议：`auto`、`chat_completions` 或 `responses`；`auto` 会为 multi-agent 模型选择 Responses API |
+| `GROK_RESPONSES_READ_TIMEOUT` | ❌ | `300` | Responses SSE 相邻事件的读取超时秒数，必须为正数 |
+| `GROK_RESPONSES_EFFORT` | ❌ | - | 全局 Responses effort；设置后强制覆盖每次 `web_search` 的 `effort` 参数 |
 | `TAVILY_API_KEY` | ❌ | - | Tavily API 密钥（用于 web_fetch / web_map） |
 | `TAVILY_API_URL` | ❌ | `https://api.tavily.com` | Tavily API 地址 |
 | `TAVILY_ENABLED` | ❌ | `true` | 是否启用 Tavily |
@@ -161,9 +163,9 @@ claude mcp list
 
 ### `web_search` — AI 网络搜索
 
-通过 Grok API 执行 AI 驱动的网络搜索。Responses 模式会调用 `/responses` 并启用 `web_search` 工具，可用于 multi-agent 模型；Chat Completions 模式保留对旧镜像站的兼容。默认 `auto` 模式会为名称包含 `multi-agent` 的模型自动选择 Responses API。
+通过 Grok API 执行 AI 驱动的网络搜索。Responses 模式会调用 `/responses`，启用 `web_search` 工具并使用 SSE 持续读取长任务；Chat Completions 模式保留对旧镜像站的兼容。默认 `auto` 模式会为名称包含 `multi-agent` 的模型自动选择 Responses API。
 
-`web_search` 输出不展开信源，仅返回 `sources_count`；Responses API 的 `url_citation` 注解及额外 Tavily/Firecrawl 信源会按 `session_id` 缓存在服务端，可用 `get_sources` 拉取。上游错误会通过返回值中的 `error` 字段明确报告，不再静默变成空正文。
+`web_search` 输出不展开信源，仅返回 `sources_count`；Responses API 的 `url_citation` 注解及额外 Tavily/Firecrawl 信源会按 `session_id` 缓存在服务端，可用 `get_sources` 拉取。返回值中的 `status` 明确区分 `completed`、`incomplete` 和 `failed`；流开始后若连接中断，不会自动重放请求，已收到的正文和来源会随 `incomplete` 状态返回。
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
@@ -171,6 +173,9 @@ claude mcp list
 | `platform` | string | ❌ | `""` | 聚焦平台（如 `"Twitter"`, `"GitHub, Reddit"`） |
 | `model` | string | ❌ | `null` | 按次指定 Grok 模型 ID |
 | `extra_sources` | int | ❌ | `0` | 额外补充信源数量（Tavily/Firecrawl，可为 0 关闭） |
+| `effort` | string | ❌ | `"high"` | Responses 模式的智能体规模：`low`、`medium`、`high` 或 `xhigh` |
+
+`low` 和 `medium` 使用 4 个智能体，适合日常查询；`high` 和 `xhigh` 使用 16 个智能体，适合深度调研且通常消耗更多 token。该参数在 Chat Completions 模式下会被忽略。例如，深度调研可调用 `web_search(query="...", effort="high")`。如需强制所有 Responses 搜索使用 `xhigh`，在 MCP 环境变量中设置 `GROK_RESPONSES_EFFORT=xhigh`；该配置优先于按次参数。
 
 自动检测查询中的时间相关关键词（如"最新""今天""recent"等），注入本地时间上下文以提升时效性搜索的准确度。
 
@@ -178,6 +183,8 @@ claude mcp list
 - `session_id`: 本次查询的会话 ID
 - `content`: Grok 回答正文（已自动剥离信源）
 - `sources_count`: 已缓存的信源数量
+- `status`: `completed`、`incomplete` 或 `failed`
+- `error`: 未正常完成时的错误说明（可选）
 
 ### `get_sources` — 获取信源
 

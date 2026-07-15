@@ -2,6 +2,11 @@ import os
 import json
 from pathlib import Path
 
+
+VALID_RESPONSE_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+DEFAULT_RESPONSE_EFFORT = "high"
+
+
 class Config:
     _instance = None
     _SETUP_COMMAND = (
@@ -63,6 +68,28 @@ class Config:
     @property
     def retry_max_wait(self) -> int:
         return int(os.getenv("GROK_RETRY_MAX_WAIT", "10"))
+
+    @property
+    def responses_read_timeout(self) -> float:
+        raw_value = os.getenv("GROK_RESPONSES_READ_TIMEOUT", "300").strip()
+        try:
+            timeout = float(raw_value)
+        except ValueError as exc:
+            raise ValueError("GROK_RESPONSES_READ_TIMEOUT 必须是正数") from exc
+        if timeout <= 0:
+            raise ValueError("GROK_RESPONSES_READ_TIMEOUT 必须是正数")
+        return timeout
+
+    @property
+    def responses_effort(self) -> str | None:
+        raw_value = os.getenv("GROK_RESPONSES_EFFORT")
+        if raw_value is None or not raw_value.strip():
+            return None
+        effort = raw_value.strip().lower()
+        if effort not in VALID_RESPONSE_EFFORTS:
+            valid = ", ".join(sorted(VALID_RESPONSE_EFFORTS))
+            raise ValueError(f"GROK_RESPONSES_EFFORT must be one of: {valid}")
+        return effort
 
     @property
     def grok_api_mode(self) -> str:
@@ -193,6 +220,11 @@ class Config:
             "GROK_API_KEY": api_key_masked,
             "GROK_MODEL": self.grok_model,
             "GROK_API_MODE": self.grok_api_mode,
+            "GROK_RESPONSES_READ_TIMEOUT": self.responses_read_timeout,
+            "GROK_RESPONSES_EFFORT": (
+                self.responses_effort
+                or f"per-request (default: {DEFAULT_RESPONSE_EFFORT})"
+            ),
             "GROK_DEBUG": self.debug_enabled,
             "GROK_LOG_LEVEL": self.log_level,
             "GROK_LOG_DIR": str(self.log_dir),
